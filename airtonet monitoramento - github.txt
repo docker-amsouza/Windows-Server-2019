@@ -1,0 +1,114 @@
+# =====================================================================
+# AIRONET - MONITORAMENTO VIA SYSLOG
+# Captura syslog UDP 5514 e envia alertas via Telegram
+# Logs: C:\Scripts\Logs\aironet-monitoramento.log
+# Autor: AMSOUZA (versão GitHub)
+# PowerShell - Windows Server 2019
+# =====================================================================
+
+# CONFIGURAÇÕES
+$BOT_TOKEN = "<SEU_BOT_TOKEN_AQUI>"
+$CHAT_ID   = "<SEU_CHAT_ID_AQUI>"
+
+$LOG_PATH = "C:\Scripts\Logs"
+$LOG_FILE = "$LOG_PATH\aironet-monitoramento.log"
+
+if (!(Test-Path $LOG_PATH)) { New-Item -ItemType Directory -Path $LOG_PATH -Force | Out-Null }
+
+# LISTA MAC => HOSTNAME (Exemplo)
+$Hosts = @{
+    "AA:AA:AA:AA:AA:AA" = "tomada-ventilador"
+    "BB:BB:BB:BB:BB:BB" = "tv-sala"
+    "CC:CC:CC:CC:CC:CC" = "camera-quarto"
+}
+
+# FUNÇÃO PARA ENVIAR TELEGRAM
+function Send-TelegramMessage($msg) {
+    try {
+        $url = "https://api.telegram.org/bot$BOT_TOKEN/sendMessage"
+        Invoke-RestMethod -Uri $url -Method Post -Body @{
+            chat_id    = $CHAT_ID
+            text       = $msg
+            parse_mode = "HTML"
+        } -TimeoutSec 5 | Out-Null
+    }
+    catch {
+        Add-Content -Path $LOG_FILE -Value "$(Get-Date) - ERRO Telegram: $_"
+    }
+}
+
+# UDP LISTENER
+$udpClient = New-Object System.Net.Sockets.UdpClient(5514)
+$remoteEndPoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+Write-Host "✔ Syslog Server ativo na porta 5514..." -ForegroundColor Green
+
+# LOOP PRINCIPAL
+while ($true) {
+    $data = $udpClient.Receive([ref]$remoteEndPoint)
+    $message = [System.Text.Encoding]::UTF8.GetString($data)
+    $message = $message -replace "`r|`n", "" -replace "\s+", " "
+
+    $sourceIP = $remoteEndPoint.Address.IPAddressToString.Trim()
+    Add-Content -Path $LOG_FILE -Value "$(Get-Date) - $sourceIP - $message"
+
+    # --- DETECTAR MAC ---
+    $macRegex = "([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}"
+    $macFound = "N/A"
+    if ($message -match $macRegex) { $macFound = $Matches[0].ToLower() }
+
+    # --- NOME DO DISPOSITIVO ---
+    $nomeDispositivo = $Hosts[$macFound]; if (!$nomeDispositivo) { $nomeDispositivo = "Desconhecido" }
+
+    # --- LISTA DE APS (Exemplo) ---
+    $APs = @{
+        "10.0.0.101" = "AP Sala"
+        "10.0.0.102" = "AP Quarto"
+    }
+    $apNome = $APs[$sourceIP]; if (!$apNome) { $apNome = $sourceIP }
+
+    # ======================
+    # EVENTOS
+    # ======================
+
+    # ASSOC → Conectado
+    if ($message -match "ASSOC") {
+        Send-TelegramMessage @"
+🟢 <b>DISPOSITIVO CONECTADO</b>
+📡 AP: <b>$apNome</b>
+👤 Cliente: <b>$nomeDispositivo</b>
+🔗 MAC: <b>$macFound</b>
+"@
+    }
+
+    # DISASSOC / DEAUTH → Desconectado
+    if ($message -match "DISASSOC|DEAUTH") {
+        Send-TelegramMessage @"
+🔴 <b>DISPOSITIVO DESCONECTADO</b>
+📡 AP: <b>$apNome</b>
+👤 Cliente: <b>$nomeDispositivo</b>
+🔗 MAC: <b>$macFound</b>
+"@
+    }
+
+    # DHCP
+    if ($message -match "DHCPACK|New DHCP lease") {
+        Send-TelegramMessage @"
+🔵 <b>NOVA CONCESSÃO DHCP</b>
+📍 Origem: <b>$apNome</b>
+📋 Log:
+$message
+"@
+    }
+
+    # MAXRETRIES
+    if ($message -match "MAXRETRIES") {
+        Send-TelegramMessage @"
+⚠️ <b>RETRY EXCEDIDO (Wi-Fi)</b>
+📡 AP: <b>$apNome</b>
+👤 Cliente: <b>$nomeDispositivo</b>
+🔗 MAC: <b>$macFound</b>
+📋 Log:
+$message
+"@
+    }
+}

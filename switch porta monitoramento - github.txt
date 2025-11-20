@@ -1,0 +1,162 @@
+# ============================================================
+# MONITORAMENTO DE PORTAS + ALERTAS TELEGRAM (ANÔNIMO)
+# Autor: AMSOUZA (versão GitHub)
+# Função: Capturar syslog UDP 514 e enviar alertas via Telegram
+# PowerShell - Windows Server 2019
+# ============================================================
+
+# ---------- CONFIGURAÇÃO ----------
+# Substitua pelos seus valores reais antes de usar
+$BotToken  = "<SEU_BOT_TOKEN_AQUI>"
+$ChatID    = "<SEU_CHAT_ID_AQUI>"
+
+$ListenPort = 514
+$StatusDir  = "C:\Scripts\MonitorSwitchPorts"
+$LogFile    = "C:\Scripts\Logs\monitor_switch_ports.log"
+
+# ============================
+# PREPARAR DIRETÓRIOS
+# ============================
+New-Item -ItemType Directory -Force -Path $StatusDir | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
+
+# ============================
+# FUNÇÃO PARA LIMPAR CARACTERES INVISÍVEIS
+# ============================
+function CleanString([string]$str) {
+    if (-not $str) { return "" }
+    return ($str -replace '[^\x20-\x7E]', '').Trim()
+}
+
+# ============================
+# MAPA DOS SWITCHES (EXEMPLO ANÔNIMO)
+# ============================
+# Substitua pelos IPs/nome/portas reais no seu ambiente
+$switches = @(
+    "10.0.0.1|CORE|Gig0/1:servidor,Gig0/2:firewall,Gig0/3:sw-bancada",
+    "10.0.0.2|SALA|Fa0/1:pc-usuario,Fa0/2:access-point,Fa0/3:tv-box",
+    "10.0.0.3|KOPPA|Fa0/1:pc-gabrielly,Fa0/2:smart-tv,Fa0/3:notebook",
+    "10.0.0.4|ICM|Fa0/1:pc-icm,Fa0/2:access-point"
+)
+
+# ============================
+# CONVERTER SWITCHMAP
+# ============================
+$SwitchMap = @{}
+
+foreach ($entry in $switches) {
+    $p = $entry -split "\|"
+    $ip = CleanString($p[0])
+    $nome = CleanString($p[1])
+    $portas = @{}
+
+    foreach ($item in ($p[2] -split ",")) {
+        if ($item.Trim() -eq "") { continue }
+
+        $kv = $item -split ":", 2
+        $porta = CleanString($kv[0])
+        $desc  = CleanString($kv[1])
+
+        $portas[$porta] = $desc
+    }
+
+    $SwitchMap[$ip] = [PSCustomObject]@{
+        Nome   = $nome
+        Portas = $portas
+    }
+}
+
+# ============================
+# FUNÇÃO TELEGRAM
+# ============================
+function Send-TelegramMessage($Text) {
+    $url = "https://api.telegram.org/bot$BotToken/sendMessage"
+    try {
+        Invoke-RestMethod -Uri $url -Method Post -Body @{
+            chat_id    = $ChatID
+            text       = $Text
+            parse_mode = "HTML"
+        } | Out-Null
+    }
+    catch {
+        Add-Content $LogFile "$(Get-Date) - ERRO TELEGRAM: $_"
+    }
+}
+
+# ============================
+# SOCKET UDP
+# ============================
+$udp = New-Object System.Net.Sockets.UdpClient($ListenPort)
+$remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
+
+Add-Content $LogFile "$(Get-Date) - Monitor SYSLOG iniciado na porta $ListenPort"
+
+# ============================================================
+# LOOP PRINCIPAL
+# ============================================================
+while ($true) {
+    try {
+        $bytes = $udp.Receive([ref]$remote)
+    }
+    catch {
+        Add-Content $LogFile "$(Get-Date) - ERRO: Falha ao receber pacote: $_"
+        continue
+    }
+
+    if ($bytes.Length -eq 0) { continue }
+
+    $msg = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $src = $remote.Address.ToString()
+
+    Add-Content $LogFile "$(Get-Date) - $src - $msg"
+
+    # ============================
+    # DETECTAR EVENTO DE PORTA
+    # ============================
+    if ($msg -match "%LINK-3-UPDOWN" -or $msg -match "%LINEPROTO-5-UPDOWN" -or $msg -match "%LINK-5-CHANGED") {
+        if ($msg -match "Interface\s+([^,]+),") {
+            $portaOriginal = $matches[1]
+        } else { continue }
+
+        $portaCodigo = CleanString($portaOriginal)
+
+        # ESTADO
+        if ($msg -match "changed state to up") {
+            $estado = "UP"
+            $emoji = [char]0x2705
+        } elseif ($msg -match "administratively down" -or $msg -match "changed state to down") {
+            $estado = "DOWN"
+            $emoji = [char]0x26A0
+        } else { continue }
+
+        # CONSULTAR SWITCHMAP
+        if ($SwitchMap.ContainsKey($src)) {
+            $nome = $SwitchMap[$src].Nome
+            if ($SwitchMap[$src].Portas.ContainsKey($portaCodigo)) {
+                $descricao = $SwitchMap[$src].Portas[$portaCodigo]
+            } else {
+                $descricao = "Porta desconhecida"
+            }
+        } else {
+            $nome = "Desconhecido"
+            $descricao = "Desconhecido"
+        }
+
+        # STATUSFILE
+        $StatusFile = "$StatusDir\${src}_porta_$portaCodigo.status"
+        $old = ""
+        if (Test-Path $StatusFile) { $old = Get-Content $StatusFile }
+
+        # SOMENTE NOTIFICAR MUDANÇA REAL
+        if ($old -ne $estado) {
+            $estado | Out-File $StatusFile -Force
+            $mensagem = "$emoji <b>PORTA $portaCodigo</b> ($descricao)`nSwitch: <b>$nome</b>`nIP: $src`nEstado: <b>$estado</b>"
+            Send-TelegramMessage $mensagem
+            Add-Content $LogFile "$(Get-Date) - ALERTA: $src porta $portaCodigo -> $estado"
+        }
+    }
+}
+
+# ============================================================
+# FIM DO SCRIPT
+# ============================================================
